@@ -1,42 +1,71 @@
-import dateutil.parser
 import glob
 import os
-import phonenumbers
 import re
 import time
-from datetime import datetime, timedelta
+import isodate
+import dateutil.parser
+import phonenumbers
 from base64 import b64encode
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 from io import open  # adds emoji support
 from pathlib import Path
 from shutil import copyfileobj, move
 from tempfile import NamedTemporaryFile
 from time import strftime
+from bs4 import BeautifulSoup
 
-sms_backup_filename = "./gvoice-all.xml"
-sms_backup_path = Path(sms_backup_filename)
+# Call Files
+call_log_filename = "./gvoice-takeout-calls.xml"
+call_log_path = Path(call_log_filename)
 # Clear file if it already exists
-sms_backup_path.open("w").close()
-print("New file will be saved to " + sms_backup_filename)
+call_log_path.open("w").close()
+print("New call log file will be saved to " + call_log_filename)
+
+# SMS Files
+sms_log_filename = "./gvoice-takeout-sms.xml"
+sms_log_path = Path(sms_log_filename)
+# Clear file if it already exists
+sms_log_path.open("w").close()
+print("New SMS file will be saved to " + sms_log_filename)
+
+CALL_TAG_TO_TYPE = {
+    'Received': 1,
+    'Placed': 2,
+    'Missed': 3,
+    'Voicemail': 4,
+    # 'Rejected': 5,  # Not found in GV
+    'Spam': 6,
+    'Recorded': None # does not map
+}
+
+# Allowed extensions
+VIDEO_EXTENSIONS = {'.3gp', '.mp4'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic'}
+VCARD_EXTENSION = {'.vcf'}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | VCARD_EXTENSION | VIDEO_EXTENSIONS
 
 def main():
     start_time=datetime.now()
     print("Start time: ", start_time.strftime("%H:%M:%S"))
-    remove_problematic_files()
+    print("Current working directory:", os.getcwd())
+    # Get user choices from user_setup()
+    user_confirmation_process, should_delete = user_setup()
+    # Begin execution
     print("Checking directory for *.html files")
     num_sms = 0
     num_img = 0
     num_vcf = 0
     num_vid = 0
+    num_calls = 0
     root_dir = "."
     own_number = None
 
     # Create the src to filename mapping
     src_elements = extract_src(".")  # Assuming current directory
     att_filenames = list_att_filenames(".")    # Assuming current directory
-    num_img = sum(1 for filename in att_filenames if Path(filename).suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif'})
-    num_vcf = sum(1 for filename in att_filenames if Path(filename).suffix.lower() == '.vcf')
-    num_vid = sum(1 for filename in att_filenames if Path(filename).suffix.lower() == '.mp4')
+    num_img = sum(1 for filename in att_filenames if Path(filename).suffix.lower() in IMAGE_EXTENSIONS)
+    num_vcf = sum(1 for filename in att_filenames if Path(filename).suffix.lower() in VCARD_EXTENSION)
+    num_vid = sum(1 for filename in att_filenames if Path(filename).suffix.lower() in VIDEO_EXTENSIONS)
     src_filename_map = src_to_filename_mapping(src_elements, att_filenames)
 
     for subdir, dirs, files in os.walk(root_dir):
@@ -62,21 +91,37 @@ def main():
                 if a_tag:
                     own_number = a_tag.get('href').split(':', 1)[-1]  # Extracting number from href
                     break
-            # Skip files with no messages
-            if not len(messages_raw):
-                continue
+            
+            # Gate SMS processing
+            if user_confirmation_process in ('1', '3'):
+                num_sms += len(messages_raw)
 
-            num_sms += len(messages_raw)
+                if len(messages_raw):
+                    if is_group_conversation:
+                        participants_raw = soup.find_all(class_="participants")
+                        write_mms_messages(file, participants_raw, messages_raw, own_number, src_filename_map)
+                    else:
+                        write_sms_messages(file, messages_raw, own_number, src_filename_map)
+            
+            # Gate Call processing
+            if user_confirmation_process in ('2', '3'):
+                call_raw = soup.find(class_="haudio")
+                if call_raw:
+                    num_calls += write_call(call_raw, call_log_filename)
 
-            if is_group_conversation:
-                participants_raw = soup.find_all(class_="participants")
-                write_mms_messages(file, participants_raw, messages_raw, own_number, src_filename_map)
-            else:
-                write_sms_messages(file, messages_raw, own_number, src_filename_map)
+    # Finalize files based on user selection
+    if user_confirmation_process in ('1', '3'):
+        sms_log_file = open(sms_log_filename, "a")
+        sms_log_file.write("</smses>")
+        sms_log_file.close()
+        write_sms_header(sms_log_filename, num_sms)
 
-    sms_backup_file = open(sms_backup_filename, "a")
-    sms_backup_file.write("</smses>")
-    sms_backup_file.close()
+    if user_confirmation_process in ('2', '3'):
+        call_log_file = open(call_log_filename, "a")
+        call_log_file.write("</calls>")
+        call_log_file.close()
+        write_calls_header(call_log_filename, num_calls)
+
     end_time=datetime.now()
     elapsed_time = end_time - start_time
     total_seconds = int(elapsed_time.total_seconds())
@@ -91,43 +136,75 @@ def main():
     if seconds > 0 or (hours == 0 and minutes == 0):
         parts.append(f"{seconds} seconds")
     time_str = ", ".join(parts)
-    print(f"Processed {num_sms} messages, {num_img} images, {num_vid} videos, and {num_vcf} contact cards in {time_str}")
-    write_header(sms_backup_filename, num_sms)
+    print(f"Processed {num_calls} calls, {num_sms} messages, {num_img} images, {num_vid} videos, and {num_vcf} contact cards in {time_str}")
 
-def remove_problematic_files():
-    #Get user confimration before deleteing files
-    user_confirmation = input("""\
+# Function to find the calls folder
+def find_calls_folder(start_dir='.'):
+    for root, dirs, files in os.walk(start_dir):
+        if 'Calls' in dirs:
+            return os.path.join(root, 'Calls')
+    return None
 
-    Would you like to automatically remove conversations that won't convert?
-    This is conversations without attached phone numbers, ones with shortcode phone numbers,
-    or things like missed calls and voicemails.
-    If you say yes, this will automatically delete those files before converting.
-    (Y/n)? """)
-    if user_confirmation == '' or user_confirmation == 'y' or user_confirmation == 'Y':
+# Function for user to define scope (calls and sms), and opt to remove conversations that won't convert
+def user_setup():
+    # Prompt for what to process
+    print("\nChoose what to process:")
+    print("1. SMS only")
+    print("2. Calls only")
+    print("3. Both SMS and Calls")
+    user_confirmation_process = input("Enter 1, 2, or 3: ").strip()
+    while user_confirmation_process not in ('1', '2', '3'):
+        user_confirmation_process = input("Invalid choice. Enter 1, 2, or 3: ").strip()
+
+    # Prompt for user confirmation before deleting files
+    user_confirmation_delete = input("""
+Would you like to automatically remove conversations that won't convert?
+This is conversations without attached phone numbers, ones with shortcode phone numbers, or things like missed calls and voicemails.
+If you say yes, this will automatically delete those files before converting.
+(Y/N)? """).strip().lower()
+    
+    # Store boolean for deletion choice
+    should_delete = user_confirmation_delete in ('y', '')
+
+    # Gate file deletion based on should_delete
+    if should_delete:
+        print("Running file/conversation deletion logic...")
+        
         # Find files starting with " -" instead of a phone number
-        files_to_remove = glob.glob("Calls/ -*")
-        # Remove each file
-        for file in files_to_remove:
-            try:
-                os.remove(file)
-                print(f"Removed no number conversation -- {file}")
-            except OSError as e:
-                print(f"Error removing no number conversation -- {file}: {e}")
-        # Find files from a shortcode phonenumber or similar that don't import properly
-        pattern = r'^[0-9]{1,8}.*$'
-        subdirectory = './Calls'
-        files = [os.path.join(f) for f in os.listdir(subdirectory) if os.path.isfile(os.path.join(subdirectory, f))]
-        for file in files:
-            if re.match(pattern, file):
+        calls_path = find_calls_folder()
+        if calls_path:
+            print(f"Found 'Calls' folder at: {calls_path}")
+            
+            # Delete conversations with no number
+            no_num_pattern = os.path.join(calls_path, ' -*')
+            files_to_remove = glob.glob(no_num_pattern)
+            if not files_to_remove:
+                print(f"No files found matching the pattern: {no_num_pattern}")
+            
+            for file in files_to_remove:
                 try:
-                    file = os.path.join(subdirectory, file)
                     os.remove(file)
-                    print(f"Removed shortcode conversation -- {file}")
+                    print(f"Removed no number conversation: {file}")
                 except OSError as e:
-                    print(f"Error removing shortcode conversation -- {file}: {e}")
-        return None
-    else:
-        return None
+                    print(f"Error removing no number conversation: {file}: {e}")
+
+            # Delete conversations with shortcodes, reuse the 'calls_path' variable for consistency
+            pattern = r'^[0-9]{1,8}.*$'
+
+            files_in_dir = [os.path.join(calls_path, f) for f in os.listdir(calls_path) if os.path.isfile(os.path.join(calls_path, f))]
+            
+            for file in files_in_dir:
+                if re.match(pattern, os.path.basename(file)):
+                    try:
+                        os.remove(file)
+                        print(f"Removed shortcode conversation -- {file}")
+                    except OSError as e:
+                        print(f"Error removing shortcode conversation -- {file}: {e}")
+        else:
+            print("Calls folder not found. Skipping file removal.")
+
+    # Return both choices regardless of delete or not
+    return user_confirmation_process, should_delete
 
 # Fixes special characters in the vCards
 def escape_xml(s):
@@ -150,14 +227,14 @@ def extract_src(html_directory):
 
 # Function to list attachment filenames with specific extensions
 def list_att_filenames(image_directory):
-    allowed_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.vcf', '.mp4'}
     return [str(path.name) for path in Path(image_directory).rglob('*') 
-            if path.suffix.lower() in allowed_extensions]
+            if path.suffix.lower() in ALLOWED_EXTENSIONS]
 
 # Function to remove file extension and parenthesized numbers from the end of image filenames. This is used to match those filenames back to their respective img_src key.
 def normalize_filename(filename):
     # Remove the file extension and any parenthesized numbers, then truncate at 50 characters
-    return re.sub(r'(?:\((\d+)\))?\.(jpg|gif|png|vcf|mp4)$', '', filename)[:50]
+    extensions_pattern = '|'.join(ext.lstrip('.') for ext in ALLOWED_EXTENSIONS)
+    return re.sub(rf'(?:\((\d+)\))?\.({extensions_pattern})$', '', filename)[:50]
 
 # Function to sort filenames so that files with parenthesized numbers appended to the end follow the base filename.
 def custom_filename_sort(filename):
@@ -199,8 +276,7 @@ def write_sms_messages(file, messages_raw, own_number, src_filename_map):
         messages_raw, fallback_number
     )
 
-    # Search similarly named files for a fallback number. This is desperate and expensive, but
-    # hopefully rare.
+    # Search similarly named files for a fallback number. This is desperate and expensive, but hopefully rare.
     if phone_number == 0:
         file_prefix = "-".join(Path(file).stem.split("-")[0:1])
         for fallback_file in Path.cwd().glob(f"**/{file_prefix}*.html"):
@@ -227,14 +303,11 @@ def write_sms_messages(file, messages_raw, own_number, src_filename_map):
 
     sms_values = {"phone": phone_number}
 
-    sms_backup_file = open(sms_backup_filename, "a", encoding="utf8")
+    sms_backup_file = open(sms_log_filename, "a", encoding="utf8")
 
     for message in messages_raw:
-        # Check if message has an image or vCard in it and treat as mms if so
-        if message.find_all("img"):
-            write_mms_messages(file, [[participant_raw]], [message], own_number, src_filename_map)
-            continue
-        if message.find_all("a", class_='vcard'):
+        # Check if message has an image, video or vCard in it and treat as MMS if so
+        if message.find_all("img") or message.find_all("a", class_='vcard') or message.find_all("a", class_='video'):
             write_mms_messages(file, [[participant_raw]], [message], own_number, src_filename_map)
             continue
         if message.find_all("a", class_='video'):
@@ -258,20 +331,35 @@ def write_sms_messages(file, messages_raw, own_number, src_filename_map):
     sms_backup_file.close()
 
 def write_mms_messages(file, participants_raw, messages_raw, own_number, src_filename_map):
-    sms_backup_file = open(sms_backup_filename, "a", encoding="utf8")
+    sms_backup_file = open(sms_log_filename, "a", encoding="utf8")
 
     participants = get_participant_phone_numbers(participants_raw)
     participants_text = "~".join(participants)
 
     # Adding own_number to participants if it exists and is not already in the list
-    
+    def find_file_path(src, src_filename_map, file, supported_types):
+        filename = src_filename_map.get(src)
+        if filename is None or filename == "No unused match found":
+            html_filename_prefix = file.split('-', 1)[0]
+            filename = html_filename_prefix + src[src.find('-'):]
+            filename_with_ext = f"{filename}.*"
+            file_path = list(Path.cwd().glob(f"**/{filename_with_ext}"))
+            file_path = [p for p in file_path if p.suffix[1:] in supported_types]
+        else:
+            file_path = [p for p in Path.cwd().glob(f"**/*{filename}") if p.is_file()]
+
+        assert len(file_path) != 0, f"No matching files found. File name: {filename}"
+        assert len(file_path) == 1, f"Multiple potential matching files found. Files: {[x for x in file_path]!r}"
+
+        return file_path[0]
+
     for message in messages_raw:
         # Sometimes the sender tel field is blank. Try to guess the sender from the participants.
         sender = get_mms_sender(message, participants)
-        sent_by_me = sender==own_number
+        sent_by_me = sender == own_number
         if own_number not in participants:
             participants.append(own_number)
-        
+
         # Handle images and vcards
         images = message.find_all("img")
         image_parts = ""
@@ -281,124 +369,33 @@ def write_mms_messages(file, participants_raw, messages_raw, own_number, src_fil
         vcard_parts = ""
         extracted_url = ""
         if images:
-            text_only=0
+            text_only = 0
             for image in images:
-                # I have only encountered jpg and gif, but I have read that GV can ecxport png
-                supported_types = ["jpg", "png", "gif", "webp", "heic"]
+                supported_types = IMAGE_EXTENSIONS
                 image_src = image["src"]
-                # Change to use the src_filename_map to find the image filename that corresponds to the image_src value, which is unique to each image MMS message.
-                # Attempt to find a direct match for the image_src in the src_filename_map
-                image_filename = src_filename_map.get(image_src)
-                # If a direct match isn't found, prepend the start of the HTML file name to find the image name
-                if image_filename is None or image_filename == "No unused match found":  # Adjust based on your actual "not found" condition
-                    html_filename_prefix = file.split('-', 1)[0]
-                    image_filename = html_filename_prefix + image_src[image_src.find('-'):]
-                    image_filename_with_ext = f"{image_filename}.*"
-                    image_path = list(Path.cwd().glob(f"**/{image_filename_with_ext}"))
-                    image_path = [p for p in image_path if p.suffix[1:] in supported_types]
-                else:
-                    image_path = [p for p in Path.cwd().glob(f"**/*{image_filename}") if p.is_file()]                
-
-                assert (
-                    len(image_path) != 0
-                ), f"No matching images found. File name: {original_image_filename}"
-                assert (
-                    len(image_path) == 1
-                ), f"Multiple potential matching images found. Images: {[x for x in image_path]!r}"
-
-                image_path = image_path[0]
+                image_path = find_file_path(image_src, src_filename_map, file, supported_types)
                 image_type = image_path.suffix[1:]
-                image_type = "jpeg" if image_type in ["jpg", "webp"] else image_type
+                image_type = "jpeg" if image_type == "jpg" else image_type
 
                 with image_path.open("rb") as fb:
                     image_bytes = fb.read()
                 byte_string = f"{b64encode(image_bytes)}"
 
-                # Use the full path and then derive the relative path, ensuring the complete filename is used
                 relative_image_path = image_path.relative_to(Path.cwd())
-    
+
                 image_parts += (
                     f'    <part seq="0" ct="image/{image_type}" name="{relative_image_path}" '
                     f'chset="null" cd="null" fn="null" cid="&lt;{relative_image_path}&gt;" '
                     f'cl="{relative_image_path}" ctt_s="null" ctt_t="null" text="null" '
                     f'data="{byte_string[2:-1]}" />\n'
                 )
-        if videos:
-            text_only = 0
-            for video in videos:
-                # I have only encountered jpg and gif, but I have read that GV can ecxport png
-                supported_types = ["mp4"]
-                video_src = video.get("href")
-                # Change to use the src_filename_map to find the image filename that corresponds to the image_src value, which is unique to each image MMS message.
-                # Attempt to find a direct match for the image_src in the src_filename_map
-                video_filename = src_filename_map.get(video_src)
-                # If a direct match isn't found, prepend the start of the HTML file name to find the image name
-                if video_filename is None or video_filename == "No unused match found":  # Adjust based on your actual "not found" condition
-                    html_filename_prefix = file.split('-', 1)[0]
-                    video_filename = html_filename_prefix + video_src[image_src.find('-'):]
-                    video_filename_with_ext = f"{video_filename}.*"
-                    video_path = list(Path.cwd().glob(f"**/{video_filename_with_ext}"))
-                    video_path = [p for p in video_path if p.suffix[1:] in supported_types]
-                else:
-                    video_path = [p for p in Path.cwd().glob(f"**/*{video_filename}") if p.is_file()]
-
-                assert (
-                        len(video_path) != 0
-                ), f"No matching videos found. File name: {original_video_filename}"
-                assert (
-                        len(video_path) == 1
-                ), f"Multiple potential matching videos found. Images: {[x for x in video_path]!r}"
-
-                video_path = video_path[0]
-                print(f'Video path: {video_path}')
-                video_type = video_path.suffix[1:]
-
-                with video_path.open("rb") as fb:
-                    video_bytes = fb.read()
-                byte_string = f"{b64encode(video_bytes)}"
-
-                # Use the full path and then derive the relative path, ensuring the complete filename is used
-                relative_video_path = video_path.relative_to(Path.cwd())
-
-                video_parts += (
-                    f'    <part seq="0" ct="video/{video_type}" name="{relative_video_path}" '
-                    f'chset="null" cd="null" fn="null" cid="&lt;{relative_video_path}&gt;" '
-                    f'cl="{relative_video_path}" ctt_s="null" ctt_t="null" text="null" '
-                    f'data="{byte_string[2:-1]}" />\n'
-                )
-
-        # Handle vcards
         if vcards:
-            #continue
-            text_only=0
+            text_only = 0
             for vcard in vcards:
-                # I have only encountered jpg and gif, but I have read that GV can ecxport png
-                supported_types = ["vcf"]
+                supported_types = VCARD_EXTENSION
                 vcard_src = vcard.get("href")
-                # Change to use the src_filename_map to find the vcards filename that corresponds to the vcards_src value, which is unique to each vcards MMS message.
-                vcard_filename = src_filename_map.get(vcard_src)
-                # If a direct match isn't found, prepend the start of the HTML file name to find the image name
-                if vcard_filename is None or vcard_filename == "No unused match found":  # Adjust based on your actual "not found" condition
-                    html_filename_prefix = file.split('-', 1)[0]
-                    vcard_filename = html_filename_prefix + vcard_src[vcard_src.find('-'):]
-                    vcard_filename_with_ext = f"{image_filename}.*"
-                    vcard_path = list(Path.cwd().glob(f"**/{vcard_filename_with_ext}"))
-                    vcard_path = [p for p in image_path if p.suffix[1:] in supported_types]
-                else:
-                    vcard_path = [p for p in Path.cwd().glob(f"**/*{vcard_filename}") if p.is_file()]                
+                vcard_path = find_file_path(vcard_src, src_filename_map, file, supported_types)
 
-                assert (
-                    len(vcard_path) != 0
-                ), f"No matching vCards found. File name: {vcard_filename}"
-                assert (
-                    len(vcard_path) == 1
-                ), f"Multiple potential matching vCards found. vCards: {[x for x in vcard_path]!r}"
-
-                vcard_path = vcard_path[0]
-                vcard_type = vcard_path.suffix[1:]
-                
-                # This section searches for any contact cards that are just location pins, and turns them into a plain text MMS message with the URL for the pin.
-                # If you don't want to perform this conversion, then comment out this section.
                 with vcard_path.open("r", encoding="utf-8") as fb:
                     current_location_found = False
                     for line in fb:
@@ -419,26 +416,35 @@ def write_mms_messages(file, participants_raw, messages_raw, own_number, src_fil
                             relative_vcard_path = vcard_path.relative_to(Path.cwd())
     
                             vcard_parts += (
-                            f'    <part seq="0" ct="text/x-vCard" name="{relative_vcard_path}" '
-                            f'chset="null" cd="null" fn="null" cid="&lt;{relative_vcard_path}&gt;" '
-                            f'cl="{relative_vcard_path}" ctt_s="null" ctt_t="null" text="null" '
+                                f'    <part seq="0" ct="text/x-vCard" name="{relative_vcard_path}" '
+                                f'chset="null" cd="null" fn="null" cid="&lt;{relative_vcard_path}&gt;" '
+                                f'cl="{relative_vcard_path}" ctt_s="null" ctt_t="null" text="null" '
+                                f'data="{byte_string[2:-1]}" />\n'
+                            )
+        if videos:
+                    text_only = 0
+                    for video in videos:
+                        supported_types = VIDEO_EXTENSIONS
+                        video_src = video.get("href")
+                        video_path = find_file_path(video_src, src_filename_map, file, supported_types)
+                        video_type = video_path.suffix[1:]
+                        video_type = "3gpp" if video_type == "3gp" else video_type
+
+                        with video_path.open("rb") as fb:
+                            video_bytes = fb.read()
+                        byte_string = f"{b64encode(video_bytes)}"
+
+                        relative_video_path = video_path.relative_to(Path.cwd())
+
+                        video_parts += (
+                            f'    <part seq="0" ct="video/{video_type}" name="{relative_video_path}" '
+                            f'chset="null" cd="null" fn="null" cid="&lt;{relative_video_path}&gt;" '
+                            f'cl="{relative_video_path}" ctt_s="null" ctt_t="null" text="null" '
                             f'data="{byte_string[2:-1]}" />\n'
                         )
 
-                # If you don't want to convert vcards with locations to plain text MMS, uncomment this section.
-                #with vcard_path.open("rb") as fb:
-                    #vcard_bytes = fb.read()
-                    #byte_string = f"{b64encode(vcard_bytes)}"
-                    # Use the full path and then derive the relative path, ensuring the complete filename is used
-                    #relative_vcard_path = vcard_path.relative_to(Path.cwd())
-                    #vcard_parts += (
-                    #f'    <part seq="0" ct="text/x-vCard" name="{relative_vcard_path}" '
-                    #f'chset="null" cd="null" fn="null" cid="&lt;{relative_vcard_path}&gt;" '
-                    #f'cl="{relative_vcard_path}" ctt_s="null" ctt_t="null" text="null" '
-                    #f'data="{byte_string[2:-1]}" />\n'
-                #)
         else:
-            text_only=1
+            text_only = 1
         if extracted_url:
             message_text = "Dropped pin&#10;" + extracted_url
         else:
@@ -488,6 +494,25 @@ def write_mms_messages(file, participants_raw, messages_raw, own_number, src_fil
 
     sms_backup_file.close()
 
+
+def write_call(call_raw, call_log_filename):
+    number = call_raw.find('a', class_='tel').get('href').split(':', 1)[-1]
+    date = get_time_unix_call(call_raw)
+    duration_element = call_raw.find(class_='duration')
+    duration_raw = duration_element['title'] if duration_element else "PT0S"
+    duration = round(isodate.parse_duration(duration_raw).total_seconds())
+    call_type = get_call_type(call_raw)
+    if call_type is None:
+        return 0
+    if not number:
+        return 0
+    with open(call_log_filename, "a", encoding="utf8") as call_log_file:
+        call_text = (
+            f'<call number="{number}" date="{date}" duration="{duration}" type="{call_type}" presentation="1" /> \n'
+        )
+        call_log_file.write(call_text)
+    return 1
+
 def get_message_type(message):  # author_raw = messages_raw[i].cite
     author_raw = message.cite
     if not author_raw.span:
@@ -496,6 +521,18 @@ def get_message_type(message):  # author_raw = messages_raw[i].cite
         return 1
 
     return 0
+
+def get_call_type(call_raw):
+    tag_elements = call_raw.find_all('a', rel='tag')
+    for tag in tag_elements:
+        tag_text = tag.get_text(strip=True)
+        if tag_text in CALL_TAG_TO_TYPE:
+            return CALL_TAG_TO_TYPE[tag_text]
+        
+    
+    print("Tags found: ", [tag.get_text(strip=True) for tag in tag_elements])
+
+    assert False, "Could not determine call type"
 
 def get_message_text(message):
     # Attempt to properly translate newlines. Might want to translate other HTML here, too.
@@ -515,7 +552,6 @@ def get_mms_sender(message, participants):
         ), "Unable to determine sender in mms with multiple participants"
         number = participants[0]
     return number
-
 
 def get_first_phone_number(messages, fallback_number):
     # handle group messages
@@ -551,7 +587,6 @@ def get_first_phone_number(messages, fallback_number):
     )
     return fallback_number, sender_data
 
-
 def get_participant_phone_numbers(participants_raw):
     participants = []
 
@@ -585,14 +620,32 @@ def get_time_unix(message):
     # Changed this line to get the full date value including milliseconds.
     mstime = time.mktime(time_obj.timetuple()) * 1000 + time_obj.microsecond // 1000
     return int(mstime)
+    
+def get_time_unix_call(call_raw):
+    time_raw = call_raw.find(class_="published")
+    ymdhms = time_raw["title"]
+    time_obj = dateutil.parser.isoparse(ymdhms)
+    # Changed this line to get the full date value including milliseconds.
+    mstime = time.mktime(time_obj.timetuple()) * 1000 + time_obj.microsecond // 1000
+    return int(mstime)
 
-
-def write_header(filename, numsms):
+def write_sms_header(filename, numsms):
     # Prepend header in memory efficient manner since the output file can be huge
     with NamedTemporaryFile(dir=Path.cwd(), delete=False) as backup_temp:
         backup_temp.write(b"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n")
-        backup_temp.write(b"<!--Converted from GV Takeout data -->\n")
+        backup_temp.write(b"\n")
         backup_temp.write(bytes(f'<smses count="{str(numsms)}">\n', encoding="utf8"))
+        with open(filename, "rb") as backup_file:
+            copyfileobj(backup_file, backup_temp)
+    # Overwrite output file with temp file
+    move(backup_temp.name, filename)
+
+def write_calls_header(filename, numcalls):
+    # Prepend header in memory efficient manner since the output file can be huge
+    with NamedTemporaryFile(dir=Path.cwd(), delete=False) as backup_temp:
+        backup_temp.write(b"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\n")
+        backup_temp.write(b"\n")
+        backup_temp.write(bytes(f'<calls count="{str(numcalls)}">\n', encoding="utf8"))
         with open(filename, "rb") as backup_file:
             copyfileobj(backup_file, backup_temp)
     # Overwrite output file with temp file

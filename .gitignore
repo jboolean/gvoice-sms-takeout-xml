@@ -1,2 +1,13 @@
+.venv/
 sms/
-gvoice-all.xml
+/gvoice-*
+
+# User Takeout files
+Takeout/
+Voice/
+Calls/
+takeout-*
+
+# IDEs
+.idea/
+.vscode/
